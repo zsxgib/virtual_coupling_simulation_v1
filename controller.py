@@ -316,8 +316,16 @@ class ETCController:
         min_delta = 10.0
         delta_norm_safe = max(delta_norm, min_delta)
 
-        # 触发条件: ||e|| > σ * ||δ||
-        threshold = sigma * delta_norm_safe
+        # 触发条件: ||e|| > σ * ||δ|| + μ * exp(-ν * t)
+        # μ提供时间下界，解决稳态触发过多的问题
+        mu = 50.0      # 初始下界
+        nu = 0.05      # 衰减速率
+        # 改为：mu * (1 - exp(-nu*t))
+        # t=0: 0 (阈值低 → 触发容易 → 前期密集)
+        # t→∞: mu (阈值高 → 触发困难 → 后期稀疏)
+        decay_term = mu * (1 - np.exp(-nu * t))
+
+        threshold = sigma * delta_norm_safe + decay_term
         return error_norm > threshold
 
 

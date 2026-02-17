@@ -10,6 +10,8 @@ import matplotlib.patches as patches
 from matplotlib.lines import Line2D
 import json
 import os
+import sys
+import argparse
 
 # ============================================================
 # 全局设置
@@ -24,9 +26,31 @@ plt.rcParams['ytick.labelsize'] = 9
 plt.rcParams['legend.fontsize'] = 9
 plt.rcParams['figure.dpi'] = 300
 
-# 数据路径
-DATA_DIR = '/home/zsx/tmp/2025-12-07-paper/02_多智能体系统控制/9_Adaptive_Event_Driven_Consensus_Complete/virtual_coupling_simulation_v1/results/20260215_202509'
-OUTPUT_DIR = '/home/zsx/tmp/2025-12-07-paper/02_多智能体系统控制/9_Adaptive_Event_Driven_Consensus_Complete/virtual_coupling_simulation_v1/results/figures'
+# 基础目录
+BASE_DIR = '/home/zsx/tmp/2025-12-07-paper/02_多智能体系统控制/9_Adaptive_Event_Driven_Consensus_Complete/virtual_coupling_simulation_v1/results'
+OUTPUT_DIR = os.path.join(BASE_DIR, 'figures')
+
+# 命令行参数解析
+parser = argparse.ArgumentParser(description='Plot simulation results')
+parser.add_argument('data_dir', nargs='?', default=None, help='Results directory to plot')
+args = parser.parse_args()
+
+if args.data_dir:
+    # 如果指定了路径，转为绝对路径
+    if not os.path.isabs(args.data_dir):
+        DATA_DIR = os.path.join(BASE_DIR, args.data_dir)
+    else:
+        DATA_DIR = args.data_dir
+else:
+    # 自动选择最新的结果文件夹（匹配时间戳格式如20260215_202509）
+    subdirs = [d for d in os.listdir(BASE_DIR)
+               if os.path.isdir(os.path.join(BASE_DIR, d)) and d[0].isdigit()]
+    if subdirs:
+        latest = sorted(subdirs)[-1]
+        DATA_DIR = os.path.join(BASE_DIR, latest)
+        print(f"Auto-selected latest results: {DATA_DIR}")
+    else:
+        DATA_DIR = os.path.join(BASE_DIR, '20260215_202509')
 
 # 方案列表
 SCHEMES = ['A', 'B', 'C', 'D', 'E']
@@ -209,7 +233,7 @@ def plot_fig2(data):
         delta_norms = np.linalg.norm(delta, axis=2)  # (n_steps, n_trains)
         mean_delta = np.mean(delta_norms, axis=1)   # (n_steps,)
 
-        ax.semilogy(time, mean_delta + 1e-10,
+        ax.plot(time, mean_delta,
                    color=SCHEME_COLORS[scheme],
                    linestyle=LINE_STYLES[scheme],
                    linewidth=1.5,
@@ -238,39 +262,59 @@ def plot_fig3(data):
     time = data['time']
     T_end = time[-1]
 
-    # 5个方案，每行一个
-    row_height = 0.15
-    bottom_start = 0.1
+    # 5个方案，每方案8车（40行，总高度1.0）
+    row_height = 0.018  # 压缩行高
+    scheme_gap = 0.02  # 增大方案间距
+    bottom_start = 0.01
+
+    # Zeno阈值
+    zeno_threshold = 0.01  # 10ms
 
     for idx, scheme in enumerate(SCHEMES):
         triggers = data[scheme]['triggers']
         n_trains = triggers.shape[1]
 
-        # 收集所有触发时刻
-        trigger_times = []
+        # 收集每个智能体的触发时刻，计算最小间隔
+        min_intervals = []
         for i in range(n_trains):
             times = time[triggers[:, i] > 0]
-            trigger_times.extend(times)
+            if len(times) > 1:
+                intervals = np.diff(times)
+                min_intervals.append(np.min(intervals))
 
-        # 绘制散点
-        y_positions = [bottom_start + idx * (row_height + 0.05)] * len(trigger_times)
-        ax.scatter(trigger_times, y_positions,
-                  color=SCHEME_COLORS[scheme], s=15, alpha=0.7)
+        # 按智能体分别绘制（每行8个小点代表8个列车）
+        for i in range(n_trains):
+            times = time[triggers[:, i] > 0]
+            y_base = bottom_start + idx * (scheme_gap + n_trains * row_height) + i * row_height
+            y_positions = [y_base] * len(times)
+            ax.scatter(times, y_positions,
+                      color=SCHEME_COLORS[scheme], s=8, alpha=0.6)
 
-        # 绘制时间轴线
-        ax.hlines(bottom_start + idx * (row_height + 0.05), 0, T_end,
-                 color='gray', linewidth=0.5, linestyle='-')
+        # 绘制方案分隔线
+        scheme_y = bottom_start + idx * (scheme_gap + n_trains * row_height)
+        ax.hlines(scheme_y, 0, T_end, color='gray', linewidth=0.5, linestyle='-')
+
+        # 计算最小间隔（按每个智能体独立计算）
+        if min_intervals:
+            min_interval = min(min_intervals)
+            zeno_status = "[OK]" if min_interval > zeno_threshold else "[ZENO!]"
+            ax.text(T_end + 0.5, scheme_y + n_trains * row_height / 2,
+                   f'{min_interval*1000:.0f}ms {zeno_status}',
+                   ha='left', va='center', fontsize=8,
+                   color='green' if min_interval > zeno_threshold else 'red')
 
         # 方案标签
-        ax.text(-1, bottom_start + idx * (row_height + 0.05),
-               SCHEME_NAMES[scheme], ha='right', va='center',
-               fontsize=9)
+        ax.text(-1, scheme_y + n_trains * row_height / 2,
+               SCHEME_NAMES[scheme], ha='right', va='center', fontsize=9)
 
-    ax.set_xlim(-2, T_end + 1)
-    ax.set_ylim(0, 0.9)
+    # 添加Zeno阈值线
+    ax.axvline(x=zeno_threshold, color='red', linestyle='--', alpha=0.3, label='Zeno threshold (10ms)')
+
+    ax.set_xlim(-2, T_end + 3)
+    ax.set_ylim(0, 1.0)
     ax.set_xlabel('Time (s)')
     ax.set_yticks([])
-    ax.set_title('Trigger Event Distribution', fontweight='bold', pad=10)
+    ax.set_title('Trigger Event Distribution (Per-Agent Min Interval)', fontweight='bold', pad=10)
 
     # 移除边框
     ax.spines['top'].set_visible(False)

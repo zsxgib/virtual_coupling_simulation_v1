@@ -87,3 +87,10 @@ def run_all_schemes():
 if __name__ == "__main__":
     results_dir = run_all_schemes()
     print(f"\nFinal results saved to: {results_dir}/")
+
+    # 调用画图脚本
+    print("\nGenerating figures...")
+    import subprocess
+    import os
+    abs_path = os.path.abspath(results_dir)
+    subprocess.run(['python', 'plot_results.py', abs_path])
