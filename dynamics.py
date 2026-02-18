@@ -64,6 +64,74 @@ class TrainPlatoon:
         # 保存T1的初始位置（用于虚拟领航者计算）
         self.p_T1_initial = self.trains[0].state[0] if self.trains else 0.0
 
+        # 分布式观测器: 每列车维护对虚拟领航者状态的估计
+        # x̂_leader_i 表示列车i对虚拟领航者状态的估计
+        self.leader_estimates = np.zeros((self.n_trains, 2))
+        self._init_leader_estimates()
+
+        # 观测器增益参数
+        self.observer_gain = params.get('observer_gain', 0.3)
+
+    def _init_leader_estimates(self):
+        """初始化领航者估计（使用名义值，避免继承随机扰动）"""
+        # T1直接跟踪虚拟领航者
+        self.leader_estimates[0] = np.array([
+            self.p_T1_initial,
+            self.v_nominal
+        ])
+
+        # 其他列车: 初始估计基于名义值（不考虑随机扰动）
+        # 假设每列车在虚拟领航者后方 i * d_desired 处
+        for i in range(1, self.n_trains):
+            # 使用名义值初始化
+            self.leader_estimates[i] = np.array([
+                self.p_T1_initial - i * self.d_desired,  # 名义位置
+                self.v_nominal  # 名义速度
+            ])
+
+    def get_leader_estimates(self) -> np.ndarray:
+        """获取所有列车的领航者估计"""
+        return self.leader_estimates.copy()
+
+    def update_leader_estimates(self, broadcast_states: np.ndarray, dt: float, t: float = 0.0):
+        """
+        更新领航者估计（分布式观测器）
+
+        简单版本: x̂_leader_i = broadcast_{i-1} + d_desired
+
+        即每列车认为领航者在"前车广播位置 + 期望间距"处
+
+        使用广播状态而非真实状态，因为列车只能获取邻居的广播状态
+
+        Args:
+            broadcast_states: 广播状态数组 (n_trains, 2)
+            dt: 时间步长
+            t: 当前时间（用于计算虚拟领航者位置）
+        """
+        new_estimates = self.leader_estimates.copy()
+
+        # T1直接跟踪虚拟领航者
+        virtual_state = self.get_virtual_leader_state(t)
+        new_estimates[0] = virtual_state.copy()
+
+        # 其他列车: 基于前车的广播状态估计领航者位置
+        for i in range(1, self.n_trains):
+            # 前车的广播状态
+            prev_broadcast = broadcast_states[i-1]
+
+            # 领航者估计 = 前车广播位置 + 期望间距
+            # 这是因为前车应该在前车与领航者中间
+            leader_estimate = np.array([
+                prev_broadcast[0] + self.d_desired,
+                prev_broadcast[1]  # 速度假设相同
+            ])
+
+            # 使用观测器增益进行平滑
+            new_estimates[i] = (1 - self.observer_gain) * self.leader_estimates[i] + \
+                               self.observer_gain * leader_estimate
+
+        self.leader_estimates = new_estimates
+
     def _compute_true_matrices(self) -> Tuple[np.ndarray, np.ndarray]:
         """
         计算真实系统矩阵（基于Davis公式线性化）
@@ -188,11 +256,17 @@ class TrainPlatoon:
 
     def compute_delta(self, t: float) -> np.ndarray:
         """
-        计算相对状态误差 δ
+        计算相对状态误差 δ（虚拟拓扑重构版本）
 
-        定义（SIMULATION_PLAN.md 4.4节）:
-        - T1: δ_1 = [p_virtual - p_1, v_virtual - v_1]^T
-        - T2-T8: δ_i = [p_{i-1} - p_i - d_desired, v_{i-1} - v_i]^T
+        改进：引入虚拟邻居机制，链尾列车同时参考T1和前车
+        - 等效于增大图连通性，减小信息传播延迟
+
+        公式:
+        δ_i = α_i * δ_i^chain + β_i * δ_i^virtual
+        其中:
+        - δ_i^chain: 原始链式误差 (与前车比较)
+        - δ_i^virtual: 虚拟误差 (与T1比较，考虑链首-链尾距离)
+        - α_i + β_i = 1, β_i 随 i 增大
 
         Args:
             t: 当前时间
@@ -207,13 +281,66 @@ class TrainPlatoon:
             if i == 0:
                 # T1: 与虚拟领航者比较
                 virtual_state = self.get_virtual_leader_state(t)
-                delta[i, 0] = virtual_state[0] - train.get_position() - 0
+                delta[i, 0] = virtual_state[0] - train.get_position()
                 delta[i, 1] = virtual_state[1] - train.get_velocity()
             else:
-                # T2-T8: 与前车比较
+                # T2-T8: 虚拟拓扑重构
                 prev_train = self.trains[i - 1]
-                delta[i, 0] = prev_train.get_position() - train.get_position() - self.d_desired
-                delta[i, 1] = prev_train.get_velocity() - train.get_velocity()
+
+                # 链式误差 (与前车比较)
+                delta_chain_pos = prev_train.get_position() - train.get_position() - self.d_desired
+                delta_chain_vel = prev_train.get_velocity() - train.get_velocity()
+
+                # 虚拟误差 (与T1比较，考虑链首-链尾距离)
+                # T1到T8的期望距离 = 7 * d_desired
+                leader_train = self.trains[0]
+                leader_state = self.get_virtual_leader_state(t)
+                leader_pos = leader_state[0] - i * self.d_desired  # T1前方i个间距
+                delta_virtual_pos = leader_pos - train.get_position()
+                delta_virtual_vel = leader_state[1] - train.get_velocity()
+
+                # 虚拟权重: β_i = 0.25 * i / (N-1) (减小以减少触发)
+                # T2: β=0.025, T8: β=0.25
+                beta = 0.25 * i / max(1, self.n_trains - 1)
+                alpha = 1.0 - beta
+
+                # 组合误差
+                delta[i, 0] = alpha * delta_chain_pos + beta * delta_virtual_pos
+                delta[i, 1] = alpha * delta_chain_vel + beta * delta_virtual_vel
+
+        return delta
+
+    def compute_delta_observer(self, t: float) -> np.ndarray:
+        """
+        计算相对状态误差 δ（使用分布式观测器版本）
+
+        使用每列车对虚拟领航者的估计来计算相对误差:
+        - T1: δ_1 = [p_virtual - p_1, v_virtual - v_1]^T
+        - T2-T8: δ_i = [x̂_leader_i[0] - p_i - d_desired*i, x̂_leader_i[1] - v_i]^T
+
+        这样T8可以直接与领航者比较，而非通过7跳级联
+
+        Args:
+            t: 当前时间
+
+        Returns:
+            delta: 相对误差数组 (n_trains, 2)
+        """
+        delta = np.zeros((self.n_trains, 2))
+        states = self.get_states()
+
+        for i, train in enumerate(self.trains):
+            if i == 0:
+                # T1: 与虚拟领航者比较
+                virtual_state = self.get_virtual_leader_state(t)
+                delta[i, 0] = virtual_state[0] - train.get_position()
+                delta[i, 1] = virtual_state[1] - train.get_velocity()
+            else:
+                # T2-T8: 与估计的领航者状态比较（考虑自身在链中的位置）
+                leader_estimate = self.leader_estimates[i]
+                # 考虑当前列车i与领航者之间的期望间距: i * d_desired
+                delta[i, 0] = leader_estimate[0] - train.get_position() - self.d_desired * i
+                delta[i, 1] = leader_estimate[1] - train.get_velocity()
 
         return delta
 

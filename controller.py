@@ -46,6 +46,7 @@ class ETCController:
         self.state_dim = state_dim
         self.input_dim = input_dim
         self.params = controller_params
+        self.n_trains = controller_params.get('n_trains', 8)
 
         # 阈值参数
         self.sigma_min = controller_params.get('sigma_min', 0.01)
@@ -63,6 +64,12 @@ class ETCController:
         self.lambda_A = controller_params.get('lambda_A', 1e-6)
         self.gamma_B = controller_params.get('gamma_B', 1e-6)
 
+        # 积分阻尼增益 (用于消除链式拓扑的稳态误差)
+        self.K_i = controller_params.get('K_i', 0.5)
+
+        # 导数增益 (用于预测和抵抗误差变化 - 类似PD控制)
+        self.K_d = controller_params.get('K_d', 10.0)
+
         # 参数投影约束
         self.A_max = controller_params.get('A_max', 10.0)
         self.B_max = controller_params.get('B_max', 10.0)
@@ -70,10 +77,17 @@ class ETCController:
         # 防Zeno参数
         self.zeno_interval = controller_params.get('zeno_interval', 0.01)
 
+        # 跟踪每个agent的delta历史用于趋势检测
+        self.delta_history = {}  # {agent_idx: [delta_norm的历史]}
+
         # 方案参数
         self.fixed_threshold = controller_params.get('fixed_threshold', 0.3)
         self.periodic_interval = controller_params.get('periodic_interval', 1.0)
         self.adaptive_type = controller_params.get('adaptive_type', 'lyapunov_driven')
+
+        # 分级参数（方案2和方案3）
+        self.mu_alpha = controller_params.get('mu_alpha', 0.2)    # μ分级系数
+        self.sigma_min_beta = controller_params.get('sigma_min_beta', 0.1)  # σ_min分级系数
 
         # 基于名义矩阵计算K（关键：不是真值！）
         Q_weight = controller_params.get('Q_weight', 3e7)
@@ -134,21 +148,39 @@ class ETCController:
         A_hat: np.ndarray,
         x_hat: np.ndarray,
         delta: np.ndarray,
+        delta_integral: np.ndarray = None,
+        delta_derivative: np.ndarray = None,
     ) -> np.ndarray:
         """
-        控制律: u = Â x̂ + K δ
+        控制律: u = Â x̂ + K δ + K_i * ∫δ dt + K_d * dδ/dt (类似PD控制)
 
         Args:
             A_hat: 自适应估计的A矩阵
             x_hat: 广播状态（ZOH保持）
             delta: 相对状态误差
+            delta_integral: 相对误差的积分 (∫δ dt)
+            delta_derivative: 相对误差的导数 (dδ/dt)
 
         Returns:
             u: 控制输入
         """
         A_hat_x_hat = A_hat @ x_hat
         K_delta = self.K @ delta
-        return A_hat_x_hat + K_delta
+
+        # 基础控制
+        u = A_hat_x_hat + K_delta
+
+        # 添加积分项以消除稳态误差
+        if delta_integral is not None:
+            K_i_delta_int = self.K_i * delta_integral
+            u = u + K_i_delta_int
+
+        # 添加导数项以预测和抵抗误差变化
+        if delta_derivative is not None:
+            K_d_delta_dot = self.K_d * delta_derivative
+            u = u + K_d_delta_dot
+
+        return u
 
     def compute_A_hat_update(
         self,
@@ -212,20 +244,18 @@ class ETCController:
         delta: np.ndarray,
         dt: float,
         t: float = 0.0,
+        agent_idx: int = 0,
     ) -> float:
         """
-        σ的自适应更新（5种方案）
+        σ的自适应更新（5种方案，含分级策略）
 
-        SIMULATION_PLAN.md 4.11节:
-
-        | 方案 | 连续时间公式 | 离散化 |
-        |------|--------------|--------|
-        | A (periodic) | 不使用σ | 定时触发 |
-        | B (fixed) | σ = 0.3 | σ不变 |
-        | C (error_driven) | σ̇ = -α·||e||² | σ = σ_min + (σ-σ_min)·exp(-α·||e||²·dt) |
-        | D (state_driven) | σ = σ_min + k/(||δ̃|| + c) | 直接计算 |
-        | E (lyapunov_driven) | σ̇ = -γ·(σ-σ_min)·||δ̃||² | σ = σ_min + (σ-σ_min)·exp(-γ·||δ̃||²·dt) |
+        分级策略：链尾使用更低的σ_min，更激进触发
+        sigma_min_i = base_sigma_min * (1 + beta * (n_trains - 1 - agent_idx))
         """
+        # 计算分级sigma_min（链尾更低）
+        # T1: sigma_min, T8: sigma_min * (1 + 7*beta)
+        sigma_min_i = self.sigma_min * (1 + self.sigma_min_beta * (7 - agent_idx))
+
         tilde_delta_norm = self.compute_tilde_delta_norm(delta)
 
         if self.adaptive_type == "periodic":
@@ -237,43 +267,36 @@ class ETCController:
             sigma_new = self.fixed_threshold
 
         elif self.adaptive_type == "error_driven":
-            # Error-Driven: 当 e 大时，sigma 应该大（减少触发）
-            # 论文公式 σ̇ = -α||e||² 是减少的，但我们需要反向
-            # 改为: σ̇ = +α||e||² 使 e 大时 sigma 增加
-            alpha = 0.1  # 设计参数
+            # Error-Driven: 当 e 大时，sigma 增加（减少触发）
+            # 论文公式 σ̇ = -α||e||² 是减少的，但我们的目标是前期密集触发
+            # 所以改为: σ̇ = +α||e||² 使 e 大时 sigma 增加
+            alpha = 0.1
             e_norm_sq = np.linalg.norm(e) ** 2
             sigma_new = sigma + alpha * e_norm_sq * dt
-            # 限制 sigma 在 [sigma_min, sigma_max] 范围内
-            sigma_new = np.clip(sigma_new, self.sigma_min, self.sigma_max)
+            sigma_new = np.clip(sigma_new, sigma_min_i, self.sigma_max)
 
         elif self.adaptive_type == "state_driven":
-            # State-Driven: 论文公式 σ = k/(||δ|| + c) + σ_min
-            # δ 大 → σ 小，δ 小 → σ 大
-            # 这个公式是正确的
-            k_param = 1.0  # 设计参数
-            c_param = 0.5  # 设计参数
-            delta_norm = np.linalg.norm(delta)
-            sigma_target = k_param / (delta_norm + c_param) + self.sigma_min
-            # 限制在合理范围
-            sigma_target = np.clip(sigma_target, self.sigma_min, self.sigma_max)
-            # 使用一阶低通滤波使变化平滑
-            tau = 1.0  # 时间常数
-            sigma_new = sigma + (sigma_target - sigma) / tau * dt
+            # State-Driven: 改为与误差相关的绝对阈值
+            # σ = σ_min + k * ||δ̃|| / (||δ̃|| + c) 确保在 δ̃ 小时 σ 不会太小
+            tilde_delta_norm = self.compute_tilde_delta_norm(delta)
+            target_sigma = sigma_min_i + self.k * tilde_delta_norm / (tilde_delta_norm + self.c)
+            # 平滑过渡
+            tau = 5.0
+            decay = np.exp(-self.gamma * dt / tau)
+            sigma_new = target_sigma + (sigma - target_sigma) * decay
 
         elif self.adaptive_type == "lyapunov_driven":
-            # Lyapunov-Driven: 当 δ 大时，sigma 应该小（减少触发）
-            # 论文公式 σ̇ = -γ(σ-σ_min)||δ||² 是减少的
-            # 进一步调小 gamma 使 sigma 下降更慢
-            gamma = 0.001  # 设计参数，非常小
-            delta_norm_sq = np.linalg.norm(delta) ** 2
-            sigma_new = sigma - gamma * (sigma - self.sigma_min) * delta_norm_sq * dt
-            # 限制 sigma 在 [sigma_min, sigma_max] 范围内
-            sigma_new = np.clip(sigma_new, self.sigma_min, self.sigma_max)
+            # Lyapunov-Driven: 改为单调上升 σ = σ_max - (σ_max - σ_min) * exp(-η*t)
+            # 早期: σ小→阈值低→触发多
+            # 后期: σ大→阈值高→触发少
+            eta = 0.1  # 时间衰减速率
+            sigma_new = self.sigma_max - (self.sigma_max - sigma_min_i) * np.exp(-eta * t)
+            sigma_new = np.clip(sigma_new, sigma_min_i, self.sigma_max)
 
         else:
             sigma_new = sigma
 
-        return np.clip(sigma_new, self.sigma_min, self.sigma_max)
+        return sigma_new
 
     def check_trigger(
         self,
@@ -282,11 +305,15 @@ class ETCController:
         sigma: float,
         t: float,
         last_trigger_time: float,
+        agent_idx: int = 0,
+        neighbor_trigger_time: float = 0.0,
     ) -> bool:
         """
-        触发条件判断
+        触发条件判断（包含预测性触发）
 
-        触发条件: ||e|| > σ * ||δ||
+        触发条件:
+        1. 被动触发: ||e|| > σ + μ(t) + inhibit_boost
+        2. 预测触发: 误差正在增加且将在 horizon 内超过阈值
 
         Args:
             e: 测量误差 (x̂ - x)
@@ -294,6 +321,9 @@ class ETCController:
             sigma: 当前阈值
             t: 当前时间
             last_trigger_time: 上次触发时间
+            agent_idx: 代理索引（用于分级参数）
+            neighbor_trigger_time: 前车的上次触发时间
+            error_derivative: 误差变化率 de/dt
 
         Returns:
             triggered: 是否触发
@@ -306,27 +336,74 @@ class ETCController:
         if t - last_trigger_time < self.zeno_interval:
             return False
 
+        # 协同触发机制 - Negative Coupling (论文Section V-C)
+        # 当邻居触发时，通过减少||δ_i||来抑制邻居的触发
+        # 我们的实现：利用这个机制减少级联触发
+        inhibit_boost = 0.0  # 额外的抑制阈值
+        compensate_boost = 0.0  # 补偿阈值（当邻居久未触发时）
+
+        if agent_idx > 0:  # 非头车
+            # 1. Negative Coupling: 邻居刚触发时，抑制自己的触发
+            # 自适应抑制窗口：链尾需要更长的抑制时间
+            delta_norm = np.linalg.norm(delta)
+            tau_inhibit = 0.2 + 0.15 * min(delta_norm / 10.0, 5.0)  # 0.2-0.95s 自适应
+            # 链尾(T8, agent_idx=7)需要更长的抑制
+            tau_inhibit = tau_inhibit * (1 + 0.1 * agent_idx)
+
+            time_since_neighbor_trigger = t - neighbor_trigger_time
+            if 0 < time_since_neighbor_trigger < tau_inhibit:
+                # 指数衰减的抑制强度
+                decay_ratio = time_since_neighbor_trigger / tau_inhibit
+                inhibit_boost = 25.0 * (1.0 - decay_ratio)  # 最大25.0
+
+            # 2. 补偿机制: 邻居久未触发时，降低阈值补偿信息延迟
+            # 链尾需要更激进的补偿
+            tau_compensate = 2.0 + 0.2 * agent_idx  # 2.0-3.4s
+            if time_since_neighbor_trigger > tau_compensate:
+                # 超过补偿窗口，开始降低阈值（增加触发概率）
+                compensate_factor = min((time_since_neighbor_trigger - tau_compensate) / 5.0, 1.0)
+                compensate_boost = -30.0 * compensate_factor  # 最多降低30.0阈值
+
         # 计算误差范数
         error_norm = np.linalg.norm(e)
 
         # 使用非归一化delta范数
         delta_norm = np.linalg.norm(delta)
 
-        # 最小阈值保护（防止δ≈0时频繁触发）
-        min_delta = 10.0
-        delta_norm_safe = max(delta_norm, min_delta)
+        # 趋势检测：当delta上升时，降低阈值更容易触发
+        trend_boost = 0.0
+        if agent_idx not in self.delta_history:
+            self.delta_history[agent_idx] = []
+        self.delta_history[agent_idx].append(delta_norm)
+        # 保持历史长度
+        if len(self.delta_history[agent_idx]) > 100:
+            self.delta_history[agent_idx].pop(0)
+        # 检测趋势：最近10步平均 vs 之前10步平均
+        hist = self.delta_history[agent_idx]
+        if len(hist) >= 20:
+            recent = np.mean(hist[-10:])
+            older = np.mean(hist[-20:-10])
+            if recent > older * 1.05:  # 上升趋势 >5%
+                trend_boost = -2.0  # 轻微降低阈值(减少以降低触发)
 
-        # 触发条件: ||e|| > σ * ||δ|| + μ * exp(-ν * t)
-        # μ提供时间下界，解决稳态触发过多的问题
-        mu = 50.0      # 初始下界
-        nu = 0.05      # 衰减速率
-        # 改为：mu * (1 - exp(-nu*t))
-        # t=0: 0 (阈值低 → 触发容易 → 前期密集)
-        # t→∞: mu (阈值高 → 触发困难 → 后期稀疏)
-        decay_term = mu * (1 - np.exp(-nu * t))
+        # 触发条件: ||e_i|| > σ * ||δ|| / w_i + μ(t) + trend_boost
+        # 位置权重 - 链尾更容易触发
+        alpha_weight = 0.3
+        w_i = 1.0 + alpha_weight * agent_idx / max(1, self.n_trains - 1)
 
-        threshold = sigma * delta_norm_safe + decay_term
-        return error_norm > threshold
+        mu_0 = 1.0         # 初始下界
+        mu_final = 40.0    # 稳态下界
+        mu_t = mu_final - (mu_final - mu_0) * np.exp(-0.3 * t)
+
+        threshold = sigma * delta_norm / w_i + mu_t + inhibit_boost + compensate_boost + trend_boost
+
+        # 检查被动触发条件
+        if error_norm > threshold:
+            return True
+
+        # 预测性触发已禁用 - 导致触发次数暴增
+
+        return False
 
 
 class TriggerMonitor:

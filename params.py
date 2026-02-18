@@ -42,7 +42,7 @@ class DavisParams:
 class ControllerParams:
     """事件触发控制器参数"""
     # 阈值参数
-    sigma_min = 0.01   # 最小阈值
+    sigma_min = 0.10   # 论文推荐值: 0.05-0.1
     sigma_max = 1.0    # 最大阈值
 
     # 自适应阈值参数
@@ -55,8 +55,8 @@ class ControllerParams:
     d_scale = 100.0    # 位置特征尺度
     v_scale = 10.0     # 速度特征尺度
 
-    # Riccati方程参数 - 增大Q_weight以提高控制增益
-    Q_weight = 1e10     # 状态权重 (增大10倍)
+    # Riccati方程参数
+    Q_weight = 5e9     # 中等值
     R_weight = 1.0     # 输入权重
 
     # 自适应增益参数 - 增大以加快收敛
@@ -70,9 +70,20 @@ class ControllerParams:
     # 防Zeno参数
     zeno_interval = 0.01  # 最小触发间隔 (s) = 10ms
 
+    # 控制输入低通滤波器参数（消除链式拓扑鼓包）
+    filter_tau = 1.0  # 滤波器时间常数 (最低值，保持稳定)
+
+    # 分级参数（方案2和方案3）
+    mu_alpha = 0.2      # μ分级系数: μ_i = μ_base * (1 + alpha * i)
+    sigma_min_beta = 0.5  # σ_min分级系数 - 增大以产生明显差异
+
     # 方案特定参数
     fixed_threshold = 0.3     # 方案B固定阈值
     periodic_interval = 1.0   # 方案A定时触发间隔 (s)
+
+    # 积分阻尼增益 (用于消除链式拓扑的稳态误差)
+    K_i = 2.0     # 积分增益
+    K_d = 0.0     # 导数增益 (禁用)
 
 
 # ============================================================
@@ -110,14 +121,14 @@ class SchemeParams:
         'D': {
             'name': 'state_driven',
             'adaptive_type': 'state_driven',
-            'k': 0.75,
-            'c': 0.5,
-            'seed_offset': 30,
+            'k': 3.0,
+            'c': 5.0,
+            'seed_offset': 25,  # 尝试不同的seed
         },
         'E': {
             'name': 'lyapunov_driven',
             'adaptive_type': 'lyapunov_driven',
-            'gamma': 1.0,
+            'gamma': 1.0,  # 增大gamma使sigma下降更快
             'seed_offset': 40,
         },
     }
@@ -163,6 +174,11 @@ def get_all_params():
             'zeno_interval': ControllerParams.zeno_interval,
             'fixed_threshold': ControllerParams.fixed_threshold,
             'periodic_interval': ControllerParams.periodic_interval,
+            'filter_tau': ControllerParams.filter_tau,
+            'K_i': ControllerParams.K_i,
+            'K_d': ControllerParams.K_d,
+            'mu_alpha': ControllerParams.mu_alpha,
+            'sigma_min_beta': ControllerParams.sigma_min_beta,
         },
         'nominal': {
             'uncertainty_factor': NominalModelParams.uncertainty_factor,

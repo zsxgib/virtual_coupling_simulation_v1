@@ -93,4 +93,6 @@ if __name__ == "__main__":
     import subprocess
     import os
     abs_path = os.path.abspath(results_dir)
-    subprocess.run(['python', 'plot_results.py', abs_path])
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    plot_script = os.path.join(script_dir, 'plot_results.py')
+    subprocess.run(['python', plot_script, abs_path])

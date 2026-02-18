@@ -46,11 +46,13 @@ else:
     subdirs = [d for d in os.listdir(BASE_DIR)
                if os.path.isdir(os.path.join(BASE_DIR, d)) and d[0].isdigit()]
     if subdirs:
+        # 按时间戳排序（最新的在最后）
         latest = sorted(subdirs)[-1]
         DATA_DIR = os.path.join(BASE_DIR, latest)
         print(f"Auto-selected latest results: {DATA_DIR}")
     else:
-        DATA_DIR = os.path.join(BASE_DIR, '20260215_202509')
+        print(f"Warning: No results found in {BASE_DIR}")
+        DATA_DIR = BASE_DIR  # Use BASE_DIR itself as fallback
 
 # 方案列表
 SCHEMES = ['A', 'B', 'C', 'D', 'E']
@@ -250,6 +252,40 @@ def plot_fig2(data):
     plt.savefig(f'{OUTPUT_DIR}/Fig2_Error_Comparison.png', dpi=300, bbox_inches='tight')
     plt.close()
     print("Fig.2 saved.")
+
+
+def plot_fig2b(data):
+    """绘制 Fig.2b 相对误差对比（每个方案8车分别显示）"""
+    fig, axes = plt.subplots(5, 1, figsize=(10, 12), sharex=True)
+
+    time = data['time']
+    train_colors = plt.cm.gray(np.linspace(0.3, 0.9, 8))
+
+    for idx, scheme in enumerate(SCHEMES):
+        ax = axes[idx]
+        delta = data[scheme]['delta']
+
+        # 计算每个车的误差
+        delta_norms = np.linalg.norm(delta, axis=2)  # (n_steps, n_trains)
+
+        for i in range(8):
+            ax.plot(time, delta_norms[:, i],
+                   color=train_colors[i],
+                   linewidth=1.0,
+                   alpha=0.7)
+
+        ax.set_ylabel(r'$||\delta(t)||_2$')
+        ax.set_title(f'{SCHEME_NAMES[scheme]}', fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(0, time[-1])
+
+    axes[-1].set_xlabel('Time (s)')
+    plt.suptitle('Relative Error for Each Train (5 Schemes × 8 Trains)', y=1.01, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(f'{OUTPUT_DIR}/Fig2b_PerTrain_Error.pdf', dpi=300, bbox_inches='tight')
+    plt.savefig(f'{OUTPUT_DIR}/Fig2b_PerTrain_Error.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    print("Fig.2b saved.")
 
 
 # ============================================================
@@ -476,6 +512,7 @@ if __name__ == '__main__':
     plot_fig1a(data)
     plot_fig1b(data)
     plot_fig2(data)
+    plot_fig2b(data)
     plot_fig3(data)
     plot_fig4a(data)
     plot_fig4b(data)

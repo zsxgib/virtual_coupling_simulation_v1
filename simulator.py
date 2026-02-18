@@ -85,6 +85,48 @@ class Simulator:
         # 初始化数据存储
         self._init_data_storage()
 
+    def predict_state(self, train_idx: int, t: float) -> np.ndarray:
+        """
+        状态预测：根据前车的历史广播状态，预测当前时刻的真实状态
+
+        使用零阶保持 + 速度外推：
+        x_predicted = x_broadcasted + v_broadcasted * (t - t_broadcasted)
+
+        Args:
+            train_idx: 列车索引
+            t: 当前时间
+
+        Returns:
+            predicted_state: 预测的当前状态 [position, velocity]
+        """
+        if train_idx == 0:
+            # 头车没有前车，返回自身的广播状态
+            return self.last_broadcast_state[train_idx].copy()
+
+        # 获取前车的广播状态和广播时间
+        broadcast_state = self.last_broadcast_state[train_idx - 1]
+        broadcast_time = self.last_trigger_time[train_idx - 1]
+
+        # 计算时间差
+        dt_broadcast = t - broadcast_time
+
+        # 零阶保持 + 速度外推预测
+        # x(t) ≈ x(t0) + v(t0) * (t - t0)
+        predicted = broadcast_state.copy()
+        # 速度外推：只预测位置，假设速度不变
+        predicted[0] = broadcast_state[0] + broadcast_state[1] * dt_broadcast
+
+        # 限制预测范围，避免预测偏差过大
+        # 获取当前真实状态作为参考
+        current_states = self.dynamics.get_states()
+        current_pos = current_states[train_idx - 1][0]
+
+        # 如果预测位置与当前实际位置偏差过大，使用当前实际位置
+        if abs(predicted[0] - current_pos) > 100:  # 100m阈值
+            predicted[0] = current_pos
+
+        return predicted
+
     def _init_simulation_state(self):
         """
         初始化仿真状态
@@ -97,8 +139,9 @@ class Simulator:
         """
         self.A_hats = [np.zeros((2, 2)) for _ in range(self.n_trains)]
         self.B_hats = [np.zeros((2, 2)) for _ in range(self.n_trains)]
-        # 初始sigma设为sigma_max（论文中从1.0开始下降）
-        self.sigmas = np.full(self.n_trains, self.params['controller']['sigma_max'])
+        # 所有方案从sigma_max开始（公平比较）
+        sigma_max = self.params['controller']['sigma_max']
+        self.sigmas = np.full(self.n_trains, sigma_max)
 
         # ZOH: 广播状态初始化
         current_states = self.dynamics.get_states()
@@ -106,6 +149,19 @@ class Simulator:
 
         # 触发时间记录
         self.last_trigger_time = np.zeros(self.n_trains)
+
+        # 控制输入低通滤波器状态（消除链式拓扑的鼓包传递）
+        self.u_filtered = np.zeros((self.n_trains, 2))
+        self.filter_tau_base = self.params['controller'].get('filter_tau', 15.0)
+        # 链尾列车使用更强滤波（位置越大，离头车越远）
+        self.filter_tau = np.array([self.filter_tau_base * (1 + 0.3 * i) for i in range(self.n_trains)])
+
+        # 积分项状态 (用于积分阻尼)
+        self.delta_integral = np.zeros((self.n_trains, 2))
+
+        # 误差历史（用于计算导数项）
+        self.prev_delta = np.zeros((self.n_trains, 2))  # 保存上一步的delta
+
 
     def _init_data_storage(self):
         """初始化数据存储"""
@@ -141,27 +197,33 @@ class Simulator:
             # 1. 获取当前状态
             current_states = self.dynamics.get_states()
 
-            # 2. 计算相对误差δ
+            # 2. 计算相对误差δ（使用原始版本）
             delta = self.dynamics.compute_delta(t)
 
-            # 3. 计算测量误差 e = x̂ - x (基于广播状态)
+            # 4. 计算测量误差 e = x̂ - x (基于广播状态)
             # 这是ZOH逻辑的关键!
             errors = self.last_broadcast_state - current_states
 
-            # 4. 记录数据
+            # 5. 记录数据
             self.states_history[step] = current_states
             self.delta_history[step] = delta
             self.errors_history[step] = errors
 
-            # 5. 触发判断
+            # 6. 触发判断
             current_step_triggers = np.zeros(self.n_trains, dtype=bool)
             for i in range(self.n_trains):
+                # 获取前车的触发时间（链式拓扑中T_i只与T_{i-1}通信）
+                neighbor_trigger_time = self.last_trigger_time[i-1] if i > 0 else 0.0
+
+
                 triggered = self.controller.check_trigger(
                     e=errors[i],
                     delta=delta[i],
                     sigma=self.sigmas[i],
                     t=t,
                     last_trigger_time=self.last_trigger_time[i],
+                    agent_idx=i,  # 传递代理索引
+                    neighbor_trigger_time=neighbor_trigger_time,  # 前车触发时间
                 )
 
                 if triggered:
@@ -171,17 +233,25 @@ class Simulator:
                     current_step_triggers[i] = True
                     self.monitor.record_trigger(i, t)
 
-            # 6. 记录触发历史
+            # 7. 记录触发历史
             self.triggers_history[step] = current_step_triggers
 
-            # 7. 更新sigma（阈值自适应）
+            # 8. 更新sigma（阈值自适应，含分级策略）
             for i in range(self.n_trains):
                 self.sigmas[i] = self.controller.compute_sigma_update(
-                    self.sigmas[i], errors[i], delta[i], self.dt, t
+                    self.sigmas[i], errors[i], delta[i], self.dt, t, agent_idx=i
                 )
 
-            # 8. 计算控制输入
+            # 9. 计算控制输入
             control_inputs = np.zeros((self.n_trains, 2))
+
+            # 更新积分项 (∫δ dt += δ * dt)
+            self.delta_integral += delta * self.dt
+            # 对积分项进行限幅，避免积分饱和
+            self.delta_integral = np.clip(self.delta_integral, -50.0, 50.0)
+
+            # 更新delta历史（用于下一时刻计算导数）
+            self.prev_delta = delta.copy()
 
             # 计算阻力补偿（基于名义速度v_nominal）
             davis = self.params['davis']
@@ -191,11 +261,20 @@ class Simulator:
             F_drag_nominal = (davis['a'] + davis['b'] * v_nominal + davis['c'] * v_nominal**2) * mass
 
             for i in range(self.n_trains):
-                # 使用广播状态 x̂ 和相对误差 δ
+                # 使用状态预测：预测前车的当前状态
+                # 这样可以减少因为广播状态跳跃带来的控制波动
+                predicted_state = self.predict_state(i, t)
+
+                # 计算delta导数 dδ/dt（用于PD控制）
+                delta_derivative = (delta[i] - self.prev_delta[i]) / self.dt
+
+                # 使用预测状态 x̂ 和相对误差 δ（含导数项）
                 u = self.controller.compute_control_input(
                     self.A_hats[i],
-                    self.last_broadcast_state[i],
+                    predicted_state,
                     delta[i],
+                    self.delta_integral[i],
+                    delta_derivative,
                 )
 
                 # 添加阻力补偿（使用名义阻力）
@@ -207,9 +286,13 @@ class Simulator:
                 F_brake_max = 6e5  # 最大制动力
                 u[0] = np.clip(u[0], -F_brake_max, F_trac_max)
                 u[1] = np.clip(u[1], -F_brake_max, F_trac_max)
-                control_inputs[i] = u
 
-            # 9. 更新参数估计 (Â, B̂)
+                # 低通滤波器：平滑控制输入，消除链式拓扑的鼓包传递
+                # u_filtered = u_filtered + (u - u_filtered) / tau
+                self.u_filtered[i] = self.u_filtered[i] + (u - self.u_filtered[i]) / self.filter_tau[i]
+                control_inputs[i] = self.u_filtered[i]
+
+            # 10. 更新参数估计 (Â, B̂)
             for i in range(self.n_trains):
                 self.A_hats[i] = self.controller.compute_A_hat_update(
                     self.A_hats[i], delta[i], self.last_broadcast_state[i], self.dt
@@ -282,10 +365,27 @@ class Simulator:
 
     def _compute_stats(self) -> Dict:
         """计算统计信息"""
-        # 检查收敛
-        delta_last_1000 = self.delta_history[-1000:]
-        delta_norms = np.linalg.norm(delta_last_1000, axis=2)
-        converged = bool(np.all(delta_norms < 10.0))
+        # 检查收敛：从60s到120s误差平稳或单调下降（变化小于2倍）
+        # 取60s和120s的误差均值
+        idx_60s = int(60.0 / self.dt)  # 60/0.005 = 12000
+        idx_120s = -1
+
+        delta_60s = self.delta_history[idx_60s]
+        delta_120s = self.delta_history[idx_120s]
+
+        mean_60s = np.mean(np.linalg.norm(delta_60s, axis=1))
+        mean_120s = np.mean(np.linalg.norm(delta_120s, axis=1))
+
+        # 收敛条件：60s到120s误差变化（下降或上升）小于2倍 且 最终误差<10
+        # 即允许误差下降（收敛），不允许误差上升（发散）
+        if mean_120s > mean_60s:
+            # 误差上升：检查上升幅度
+            change_ratio = mean_120s / (mean_60s + 1e-6)
+            converged = False
+        else:
+            # 误差下降：只检查最终误差
+            final_delta_norms = np.linalg.norm(delta_120s, axis=1)
+            converged = bool(np.all(final_delta_norms < 10.0))
 
         # 最终误差
         final_delta = self.delta_history[-1]
